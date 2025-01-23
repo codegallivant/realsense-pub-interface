@@ -1,0 +1,8 @@
+connection:
+  host: 100.68.127.41
+  depth_port: 5555
+  color_port: 5557
+
+camera:
+  height: 480
+  width: 640
