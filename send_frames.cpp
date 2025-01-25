@@ -16,10 +16,61 @@
 namespace fs = std::filesystem;
 
 // Configuration
-constexpr int WIDTH = 640, HEIGHT = 480, FPS = 15;
+constexpr int WIDTH = 848, HEIGHT = 480, FPS = 10;
 constexpr int BATCH_SIZE = 30; // 3 seconds of data per file
 constexpr int ZSTD_LEVEL = 1;  // Fast compression
 constexpr int LZ4_ACCEL = 10;  // Max acceleration
+
+
+class SignalManager {
+public:
+    SignalManager(int timeout = 2000):
+        context(1),
+        socket(context, ZMQ_REP),
+        signal(false) 
+    {
+        socket.bind("tcp://*:5554");
+        socket.set(zmq::sockopt::rcvtimeo, timeout);
+    }
+
+    void start(std::function<void(void)> start_callback, std::function<void(void)> stop_callback) {
+        std::cout << "Waiting for signals..." << std::endl;
+        while (true) {
+            zmq::message_t request;
+            if (socket.recv(request, zmq::recv_flags::none)) {
+                std::string request_str(static_cast<char*>(request.data()), request.size());
+                if (request_str == "start") {
+                    //start
+                    if(signal == false) {
+                        std::cout << "Starting.." << std::endl;
+                        start_callback();
+                    }
+                    signal = true;
+                } else if (request_str == "stop") {
+                    //stop
+                    if(signal == true) {
+                        std::cout << "Stopping.." << std::endl;
+                        stop_callback();
+                    }
+                    signal = false;
+                } 
+                std::string reply_str = "ack";
+                zmq::message_t reply(reply_str.size());
+                memcpy(reply.data(), reply_str.data(), reply_str.size());
+                socket.send(reply, zmq::send_flags::none);
+            } else {
+                // std::cout << "No request received within the timeout period. Retrying..." << std::endl;
+            }
+        }
+    }
+
+private:
+    std::atomic<bool> signal;
+    zmq::context_t context;
+    zmq::socket_t socket;
+    int timeout;
+};
+
 
 class RealSenseProcessor {
 public:
@@ -31,8 +82,8 @@ public:
           running(false)
     {
         // RealSense configuration
-        cfg.enable_stream(RS2_STREAM_COLOR, WIDTH, HEIGHT, RS2_FORMAT_BGR8, FPS);
-        cfg.enable_stream(RS2_STREAM_DEPTH, WIDTH, HEIGHT, RS2_FORMAT_Z16, FPS);
+        cfg.enable_stream(RS2_STREAM_COLOR, WIDTH, HEIGHT, RS2_FORMAT_BGR8, 30);
+        cfg.enable_stream(RS2_STREAM_DEPTH, WIDTH, HEIGHT, RS2_FORMAT_Z16, 30);
         pipe.start(cfg);
 
         // ZeroMQ setup
@@ -50,6 +101,9 @@ public:
         running = false;
         processing_thread.join();
         writer_thread.join();
+    }
+
+    void close_pipe() {
         pipe.stop();
     }
 
@@ -226,12 +280,10 @@ private:
 
 int main() {
     RealSenseProcessor processor;
-    processor.start();
-    
-    // Run for 1 minute
-    std::this_thread::sleep_for(std::chrono::minutes(1));
-    
-    processor.stop();
-
+    auto start_callback = std::bind(&RealSenseProcessor::start, &processor);
+    auto stop_callback = std::bind(&RealSenseProcessor::stop, &processor);
+    SignalManager signal_manager;
+    signal_manager.start(start_callback, stop_callback);
+    processor.close_pipe();
     return 0;
 }

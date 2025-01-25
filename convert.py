@@ -1,3 +1,4 @@
+# Convert compressed frames to png
 import os
 import argparse
 import cv2
@@ -5,7 +6,7 @@ import zstandard as zstd
 import numpy as np
 from tqdm import tqdm
 
-def convert_bin_files(input_dir, output_dir, width=640, height=480):
+def convert_bin_files(input_dir, output_dir, width=848, height=480):
     # Create output directories
     depth_dir = os.path.join(output_dir, "depth")
     rgb_dir = os.path.join(output_dir, "rgb")
@@ -103,7 +104,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--width", 
         type=int, 
-        default=640,
+        default=848,
         help="Image width (default: 640)"
     )
     parser.add_argument(
