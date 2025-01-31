@@ -1,5 +1,7 @@
 .vscode/
 build/
+install/
+log/
 frames/
 converted/
 backup_frames/
