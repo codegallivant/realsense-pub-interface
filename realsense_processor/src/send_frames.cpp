@@ -10,8 +10,12 @@
 #include <condition_variable>
 #include <filesystem>
 #include <atomic>  
-#include <fstream>  
-
+#include <fstream>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <iomanip>
+#include <sstream>
+#include <algorithm>
 
 namespace fs = std::filesystem;
 
@@ -21,6 +25,11 @@ constexpr int BATCH_SIZE = 30; // 3 seconds of data per file
 constexpr int ZSTD_LEVEL = 1;  // Fast compression
 constexpr int LZ4_ACCEL = 10;  // Max acceleration
 
+struct GpsData {
+    double latitude;
+    double longitude;
+    double altitude;
+};
 
 class SignalManager {
 public:
@@ -40,14 +49,12 @@ public:
             if (socket.recv(request, zmq::recv_flags::none)) {
                 std::string request_str(static_cast<char*>(request.data()), request.size());
                 if (request_str == "start") {
-                    //start
                     if(signal == false) {
                         std::cout << "Starting.." << std::endl;
                         start_callback();
                     }
                     signal = true;
                 } else if (request_str == "stop") {
-                    //stop
                     if(signal == true) {
                         std::cout << "Stopping.." << std::endl;
                         stop_callback();
@@ -58,8 +65,6 @@ public:
                 zmq::message_t reply(reply_str.size());
                 memcpy(reply.data(), reply_str.data(), reply_str.size());
                 socket.send(reply, zmq::send_flags::none);
-            } else {
-                // std::cout << "No request received within the timeout period. Retrying..." << std::endl;
             }
         }
     }
@@ -71,15 +76,18 @@ private:
     int timeout;
 };
 
-
-class RealSenseProcessor {
+class RealSenseProcessor : public rclcpp::Node {
 public:
     RealSenseProcessor() 
-        : align(RS2_STREAM_COLOR),
+        : Node("realsense_processor"),
+          pipe(),
+          cfg(),
+          align(RS2_STREAM_COLOR),
           ctx(1),
           depth_socket(ctx, ZMQ_PUB),
           rgb_socket(ctx, ZMQ_PUB),
-          running(false)
+          running(false),
+          current_gps_({0.0, 0.0, 0.0})
     {
         // RealSense configuration
         cfg.enable_stream(RS2_STREAM_COLOR, WIDTH, HEIGHT, RS2_FORMAT_BGR8, 30);
@@ -89,6 +97,11 @@ public:
         // ZeroMQ setup
         depth_socket.bind("tcp://*:5555");
         rgb_socket.bind("tcp://*:5557");
+
+        // ROS2 GPS subscriber
+        gps_subscription_ = this->create_subscription<sensor_msgs::msg::NavSatFix>(
+            "/gps_cube", 10,
+            std::bind(&RealSenseProcessor::gps_callback, this, std::placeholders::_1));
     }
 
     void start() {
@@ -99,8 +112,8 @@ public:
 
     void stop() {
         running = false;
-        processing_thread.join();
-        writer_thread.join();
+        if(processing_thread.joinable()) processing_thread.join();
+        if(writer_thread.joinable()) writer_thread.join();
     }
 
     void close_pipe() {
@@ -108,16 +121,26 @@ public:
     }
 
 private:
+    void gps_callback(const sensor_msgs::msg::NavSatFix::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(gps_mutex_);
+        current_gps_.latitude = msg->latitude;
+        current_gps_.longitude = msg->longitude;
+        current_gps_.altitude = msg->altitude;
+    }
+
     void processing_loop() {
-        rs2::align align(RS2_STREAM_COLOR);
         auto next_frame = std::chrono::steady_clock::now();
 
         while(running) {
-            auto start = std::chrono::steady_clock::now();
-
-            // Capture frame
             auto frames = pipe.wait_for_frames();
             auto aligned = align.process(frames);
+            
+            // Get current GPS data
+            GpsData gps_data;
+            {
+                std::lock_guard<std::mutex> lock(gps_mutex_);
+                gps_data = current_gps_;
+            }
             
             // Process depth
             auto depth = aligned.get_depth_frame();
@@ -127,20 +150,22 @@ private:
             auto color = aligned.get_color_frame();
             auto rgb_data = compress_rgb(color);
 
-            // Network send
-            send_zmq(depth_socket, depth_data);
-            send_zmq(rgb_socket, rgb_data);
+            // Network send with GPS data
+            send_zmq_with_gps(depth_socket, depth_data, gps_data);
+            send_zmq_with_gps(rgb_socket, rgb_data, gps_data);
 
             // Queue for file writing
             {
                 std::lock_guard<std::mutex> lock(queue_mutex);
-                depth_queue.push(depth_data);
-                rgb_queue.push(rgb_data);
+                depth_queue.push({depth_data, gps_data});
+                rgb_queue.push({rgb_data, gps_data});
             }
 
-            // Maintain 10Hz rate
+            // Maintain FPS rate
             next_frame += std::chrono::milliseconds(1000/FPS);
             std::this_thread::sleep_until(next_frame);
+            
+            rclcpp::spin_some(this->get_node_base_interface());
         }
     }
 
@@ -162,14 +187,44 @@ private:
         return buffer;
     }
 
-    void send_zmq(zmq::socket_t& socket, const std::vector<uint8_t>& data) {
-        zmq::message_t msg(data.size());
-        memcpy(msg.data(), data.data(), data.size());
+    void send_zmq_with_gps(zmq::socket_t& socket, const std::vector<uint8_t>& data, const GpsData& gps) {
+        size_t total_size = 3 * sizeof(double) + data.size();
+        zmq::message_t msg(total_size);
+        
+        char* ptr = static_cast<char*>(msg.data());
+        memcpy(ptr, &gps.latitude, sizeof(double));
+        ptr += sizeof(double);
+        memcpy(ptr, &gps.longitude, sizeof(double));
+        ptr += sizeof(double);
+        memcpy(ptr, &gps.altitude, sizeof(double));
+        ptr += sizeof(double);
+        memcpy(ptr, data.data(), data.size());
+        
         socket.send(msg, zmq::send_flags::dontwait);
     }
 
+    std::string format_gps_filename(const std::string& prefix, size_t counter, const GpsData& gps) {
+        std::stringstream ss;
+        
+        std::string lat_str = std::to_string(gps.latitude);
+        std::string lon_str = std::to_string(gps.longitude);
+        std::string alt_str = std::to_string(gps.altitude);
+        
+        std::replace(lat_str.begin(), lat_str.end(), '.', '_');
+        std::replace(lon_str.begin(), lon_str.end(), '.', '_');
+        std::replace(alt_str.begin(), alt_str.end(), '.', '_');
+        
+        ss << prefix << counter << "__"
+           << lat_str << "__"
+           << lon_str << "__"
+           << alt_str
+           << ".bin";
+           
+        return ss.str();
+    }
+
     void file_writer() {
-        std::vector<std::vector<uint8_t>> depth_batch, rgb_batch;
+        std::vector<std::pair<std::vector<uint8_t>, GpsData>> depth_batch, rgb_batch;
         size_t file_counter = 0;
 
         while(running || !depth_queue.empty() || !rgb_queue.empty()) {
@@ -207,83 +262,63 @@ private:
     }
 
     void write_batch(const std::string& prefix, size_t counter,
-                    const std::vector<std::vector<uint8_t>>& batch) {
-        std::ofstream file(prefix + std::to_string(counter) + ".bin", 
-                         std::ios::binary | std::ios::trunc);
+                    const std::vector<std::pair<std::vector<uint8_t>, GpsData>>& batch) {
+        if(batch.empty()) return;
         
-        for(const auto& data : batch) {
+        std::string filename = format_gps_filename(prefix, counter, batch[0].second);
+        std::ofstream file(filename, std::ios::binary | std::ios::trunc);
+        
+        for(const auto& [data, gps] : batch) {
+            // Write GPS data
+            file.write(reinterpret_cast<const char*>(&gps.latitude), sizeof(double));
+            file.write(reinterpret_cast<const char*>(&gps.longitude), sizeof(double));
+            file.write(reinterpret_cast<const char*>(&gps.altitude), sizeof(double));
+            
+            // Write frame data size and content
             uint32_t size = data.size();
             file.write(reinterpret_cast<const char*>(&size), sizeof(size));
             file.write(reinterpret_cast<const char*>(data.data()), size);
         }
     }
 
-    // Decompression functions
-public:
-    static std::vector<cv::Mat> decompress_depth_file(const std::string& filename) {
-        std::ifstream file(filename, std::ios::binary);
-        std::vector<cv::Mat> frames;
-        
-        while(file) {
-            uint32_t size;
-            file.read(reinterpret_cast<char*>(&size), sizeof(size));
-            
-            std::vector<uint8_t> buffer(size);
-            file.read(reinterpret_cast<char*>(buffer.data()), size);
-            
-            cv::Mat frame(HEIGHT, WIDTH, CV_16UC1);
-            ZSTD_decompress(frame.data, WIDTH*HEIGHT*2, 
-                          buffer.data(), buffer.size());
-            frames.push_back(frame);
-        }
-        
-        return frames;
-    }
-
-    static std::vector<cv::Mat> decompress_rgb_file(const std::string& filename) {
-        std::ifstream file(filename, std::ios::binary);
-        std::vector<cv::Mat> frames;
-        
-        while(file) {
-            uint32_t size;
-            file.read(reinterpret_cast<char*>(&size), sizeof(size));
-            
-            std::vector<uint8_t> buffer(size);
-            file.read(reinterpret_cast<char*>(buffer.data()), size);
-            
-            cv::Mat frame = cv::imdecode(buffer, cv::IMREAD_UNCHANGED);
-            frames.push_back(frame);
-        }
-        
-        return frames;
-    }
-
-    // Member variables
 private:
+    // RealSense members
     rs2::pipeline pipe;
     rs2::config cfg;
     rs2::align align;
     
+    // ZMQ members
     zmq::context_t ctx;
     zmq::socket_t depth_socket;
     zmq::socket_t rgb_socket;
     
+    // Threading members
     std::atomic<bool> running;
     std::thread processing_thread;
     std::thread writer_thread;
     
+    // Queue members
     std::mutex queue_mutex;
-    std::queue<std::vector<uint8_t>> depth_queue;
-    std::queue<std::vector<uint8_t>> rgb_queue;
+    std::queue<std::pair<std::vector<uint8_t>, GpsData>> depth_queue;
+    std::queue<std::pair<std::vector<uint8_t>, GpsData>> rgb_queue;
+    
+    // GPS members
+    rclcpp::Subscription<sensor_msgs::msg::NavSatFix>::SharedPtr gps_subscription_;
+    std::mutex gps_mutex_;
+    GpsData current_gps_;
 };
 
-
-int main() {
-    RealSenseProcessor processor;
-    auto start_callback = std::bind(&RealSenseProcessor::start, &processor);
-    auto stop_callback = std::bind(&RealSenseProcessor::stop, &processor);
+int main(int argc, char* argv[]) {
+    rclcpp::init(argc, argv);
+    auto processor = std::make_shared<RealSenseProcessor>();
+    
     SignalManager signal_manager;
+    auto start_callback = [&]() { processor->start(); };
+    auto stop_callback = [&]() { processor->stop(); };
+    
     signal_manager.start(start_callback, stop_callback);
-    processor.close_pipe();
+    
+    processor->close_pipe();
+    rclcpp::shutdown();
     return 0;
 }
